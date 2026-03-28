@@ -1,8 +1,14 @@
 #!/bin/bash
-echo "This script include commands to run mapreduce jobs using hadoop streaming to index documents"
 
-echo "Input path is :"
-echo $1
+set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INPUT_PATH="/input/data"
 
-hdfs dfs -ls /
+echo ""
+echo ">>> [1/2] Running MapReduce pipelines"
+bash "$SCRIPT_DIR/create_index.sh" "$INPUT_PATH"
+
+echo ""
+echo ">>> [2/2] Loading HDFS index into Cassandra"
+bash "$SCRIPT_DIR/store_index.sh"

@@ -11,14 +11,8 @@ if [ -z "$HADOOP_STREAMING_JAR" ]; then
     exit 1
 fi
 
-echo "============================================================"
-echo "  Hadoop Streaming JAR : $HADOOP_STREAMING_JAR"
-echo "  Input path           : $INPUT_PATH"
-echo "============================================================"
-
-# Pipeline 1: Inverted Index (TF + DF)
 echo ""
-echo ">>> Pipeline 1: Building inverted index (TF + DF) ..."
+echo ">>> Pipeline 1: Building inverted index (TF + DF)"
 hdfs dfs -rm -r -f /indexer/index
 
 hadoop jar "$HADOOP_STREAMING_JAR" \
@@ -33,11 +27,9 @@ if [ $? -ne 0 ]; then
     echo "ERROR: Pipeline 1 failed."
     exit 1
 fi
-echo ">>> Pipeline 1 complete. Index written to /indexer/index"
 
-# Pipeline 2: Vocabulary
 echo ""
-echo ">>> Pipeline 2: Extracting vocabulary ..."
+echo ">>> Pipeline 2: Extracting vocabulary"
 hdfs dfs -rm -r -f /indexer/vocabulary
 
 hadoop jar "$HADOOP_STREAMING_JAR" \
@@ -52,11 +44,9 @@ if [ $? -ne 0 ]; then
     echo "ERROR: Pipeline 2 failed."
     exit 1
 fi
-echo ">>> Pipeline 2 complete. Vocabulary written to /indexer/vocabulary"
 
-# Pipeline 3: Document Statistics
 echo ""
-echo ">>> Pipeline 3: Computing document statistics (lengths + corpus totals) ..."
+echo ">>> Pipeline 3: Computing document statistics (lengths + corpus totals)"
 hdfs dfs -rm -r -f /indexer/stats
 
 hadoop jar "$HADOOP_STREAMING_JAR" \
@@ -71,12 +61,3 @@ if [ $? -ne 0 ]; then
     echo "ERROR: Pipeline 3 failed."
     exit 1
 fi
-echo ">>> Pipeline 3 complete. Statistics written to /indexer/stats"
-
-echo ""
-echo "============================================================"
-echo "  Index creation complete."
-echo "  /indexer/index      — inverted index (term, doc_id, tf, df)"
-echo "  /indexer/vocabulary — vocabulary    (term, df)"
-echo "  /indexer/stats      — doc stats     (doc_id, length) + global N, dlavg"
-echo "============================================================"
