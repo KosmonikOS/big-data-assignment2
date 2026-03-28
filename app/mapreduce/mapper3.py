@@ -14,10 +14,11 @@ for line in sys.stdin:
 
     doc_id, title, text = parts[0], parts[1], parts[2]
 
-    # Lowercase and extract only alphanumeric tokens
+    # Extract only alphanumeric tokens
     tokens = re.findall(r"[a-z0-9]+", text.lower())
+    length = len(tokens)
 
-    for token in tokens:
-        # Key is term, so Hadoop groups all occurrences of the same term together.
-        # Value is doc_id so the reducer knows which doc this came from.
-        print(f"{token}\t{doc_id}\t1")
+    # Per-document length record
+    print(f"{doc_id}\t{length}")
+    # For the global average calculation in the reducer
+    print(f"__GLOBAL__\t{length}")
