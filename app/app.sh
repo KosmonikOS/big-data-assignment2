@@ -11,10 +11,13 @@ bash start-services.sh
 python3 -m venv .venv
 source .venv/bin/activate
 
+# Upgrade pip to the latest version
+pip install --upgrade pip setuptools wheel
 # Install any packages
 pip install -r requirements.txt  
 
 # Package the virtual env.
+rm -f .venv.tar.gz
 venv-pack -o .venv.tar.gz
 
 # Collect data

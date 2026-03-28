@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import math
 import re
 import sys
@@ -39,42 +41,42 @@ def fetch_index_data(
     """
     cluster = Cluster([CASSANDRA_HOST])
     session = cluster.connect(KEYSPACE)
-
-    # 1. Corpus-level constants
-    row = session.execute(
-        "SELECT num_docs, avg_doc_len FROM corpus_stats WHERE id = 'global'"
-    ).one()
-    if row is None:
-        cluster.shutdown()
-        raise RuntimeError("corpus_stats table is empty — run index.sh first.")
-    num_docs = int(row.num_docs)
-    avg_doc_len = float(row.avg_doc_len)
-
-    # 2. Postings for every query term from the inverted index
-    postings: list[tuple[str, str, int, int]] = []
-    for term in query_terms:
-        rows = session.execute(
-            "SELECT term, doc_id, tf, df FROM inverted_index WHERE term = %s",
-            [term],
-        )
-        for r in rows:
-            postings.append((r.term, r.doc_id, int(r.tf), int(r.df)))
-
-    # 3. Per-document lengths and titles for every doc that matched
-    matched_doc_ids = list({p[1] for p in postings})
-    doc_lengths: dict[str, int] = {}
-    doc_titles: dict[str, str] = {}
-
-    for doc_id in matched_doc_ids:
-        r = session.execute(
-            "SELECT length, title FROM doc_stats WHERE doc_id = %s", [doc_id]
+    try:
+        # 1. Corpus-level constants
+        row = session.execute(
+            "SELECT num_docs, avg_doc_len FROM corpus_stats WHERE id = 'global'"
         ).one()
-        if r:
-            doc_lengths[doc_id] = int(r.length)
-            doc_titles[doc_id] = r.title or doc_id
+        if row is None:
+            raise RuntimeError("corpus_stats table is empty — run index.sh first.")
+        num_docs = int(row.num_docs)
+        avg_doc_len = float(row.avg_doc_len)
 
-    cluster.shutdown()
-    return num_docs, avg_doc_len, postings, doc_lengths, doc_titles
+        # 2. Postings for every query term from the inverted index
+        postings: list[tuple[str, str, int, int]] = []
+        for term in query_terms:
+            rows = session.execute(
+                "SELECT term, doc_id, tf, df FROM inverted_index WHERE term = %s",
+                [term],
+            )
+            for r in rows:
+                postings.append((r.term, r.doc_id, int(r.tf), int(r.df)))
+
+        # 3. Per-document lengths and titles for every doc that matched
+        matched_doc_ids = list({p[1] for p in postings})
+        doc_lengths: dict[str, int] = {}
+        doc_titles: dict[str, str] = {}
+
+        for doc_id in matched_doc_ids:
+            r = session.execute(
+                "SELECT length, title FROM doc_stats WHERE doc_id = %s", [doc_id]
+            ).one()
+            if r:
+                doc_lengths[doc_id] = int(r.length)
+                doc_titles[doc_id] = r.title or doc_id
+
+        return num_docs, avg_doc_len, postings, doc_lengths, doc_titles
+    finally:
+        cluster.shutdown()
 
 
 def compute_bm25(
@@ -103,7 +105,15 @@ def compute_bm25(
 
     postings_rdd = sc.parallelize(postings)
 
-    def bm25_score(record: tuple) -> tuple[str, float]:
+    def bm25_score(record: tuple[str, str, int, int]) -> tuple[str, float]:
+        """Calculate BM25 score for a document
+
+        Args:
+            record: tuple of (term, doc_id, tf, df)
+
+        Returns:
+            tuple of (doc_id, score)
+        """
         _, doc_id, tf, df = record
         N_val = bc_N.value
         dlavg_val = bc_dlavg.value
@@ -134,6 +144,7 @@ def main() -> None:
         print("No valid query terms found. Please enter query with at least one word.")
         sys.exit(0)
 
+    # Fetch index data from Cassandra
     num_docs, avg_doc_len, postings, doc_lengths, doc_titles = fetch_index_data(
         query_terms
     )
@@ -142,11 +153,13 @@ def main() -> None:
         print("No matching documents found for the given query.")
         sys.exit(0)
 
+    # Initialize Spark context
     conf = SparkConf().setAppName("BM25Search")
     sc = SparkContext(conf=conf)
     sc.setLogLevel("WARN")
 
     try:
+        # Compute BM25 scores
         top_n = compute_bm25(sc, postings, num_docs, avg_doc_len, doc_lengths, TOP_N)
     finally:
         sc.stop()

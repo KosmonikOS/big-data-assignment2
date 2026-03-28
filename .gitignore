@@ -1,5 +1,6 @@
 */kaggle.json
 *.parquet
+*.txt
 .venv.tar.gz
 
 # Byte-compiled / optimized / DLL files

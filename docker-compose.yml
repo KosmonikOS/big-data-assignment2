@@ -18,10 +18,10 @@ services:
     hostname: cluster-master
     tty: true
     working_dir: /app
-    # You can comment the entrypoint to run the script manually inside the container
-    entrypoint: 
+    entrypoint:
       - bash
-      - /app/app.sh
+      - -lc
+      - /app/app.sh; exec tail -f /dev/null
     
   cluster-slave-1:
     image: firasj/spark-docker-cluster
@@ -30,15 +30,6 @@ services:
       - spark-cluster
     hostname: cluster-slave-1
     tty: true
-  # cluster-slave-2:
-  #   image: firasj/spark-docker-cluster
-  #   container_name: cluster-slave-2
-  #   networks:
-  #     - spark-cluster
-  #   depends_on:
-  #     - cluster-slave-1
-  #   hostname: cluster-slave-2
-  #   tty: true
   cassandra-server:
     image: cassandra
     container_name: cassandra-server

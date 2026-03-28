@@ -1,44 +1,34 @@
 #!/bin/bash
 set -e
 
-# This will run only by the master node
-# starting HDFS daemons
+echo ""
+echo "> Restarting Services"
+
+# Stop existing services (ignore errors when daemons are not running)
+mapred --daemon stop historyserver 2>/dev/null || true
+$HADOOP_HOME/sbin/stop-yarn.sh 2>/dev/null || true
+$HADOOP_HOME/sbin/stop-dfs.sh  2>/dev/null || true
+
+# Allow ports and PID files to release before restarting
+sleep 3
+
+# Start HDFS, YARN, and MapReduce history server
 $HADOOP_HOME/sbin/start-dfs.sh
-
-# starting Yarn daemons
 $HADOOP_HOME/sbin/start-yarn.sh
-# yarn --daemon start resourcemanager
-
-# Start mapreduce history server
 mapred --daemon start historyserver
 
-
-# track process IDs of services
-jps -lm
-
-# subtool to perform administrator functions on HDFS
-# outputs a brief report on the overall HDFS filesystem
-hdfs dfsadmin -report
-
-# If namenode in safemode then leave it
+# Leave safemode if the namenode entered it
 hdfs dfsadmin -safemode leave
 
-# create a directory for spark apps in HDFS
+# Create Spark jars directory and user home
 hdfs dfs -mkdir -p /apps/spark/jars
 hdfs dfs -chmod 744 /apps/spark/jars
 
-
-# Copy all jars to HDFS
-hdfs dfs -put /usr/local/spark/jars/* /apps/spark/jars/
+# Copy Spark jars to HDFS
+hdfs dfs -put -f /usr/local/spark/jars/* /apps/spark/jars/
 hdfs dfs -chmod +rx /apps/spark/jars/
 
-
-# print version of Scala of Spark
-scala -version
-
-# track process IDs of services
-jps -lm
-
-# Create a directory for root user on HDFS
+# Create home directory for root user on HDFS
 hdfs dfs -mkdir -p /user/root
 
+echo "> All services are ready"

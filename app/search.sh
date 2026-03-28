@@ -6,12 +6,36 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 source "$SCRIPT_DIR/.venv/bin/activate"
 
+# Helper to supress informational output from the command
+run_quiet() {
+    local command_name="$1"
+    shift
+
+    local log_file
+    log_file="$(mktemp)"
+
+    if "$@" 2>"$log_file"; then
+        rm -f "$log_file"
+        return 0
+    fi
+
+    echo "ERROR: ${command_name} failed." >&2
+    echo "------- ${command_name} logs -------" >&2
+    cat "$log_file" >&2
+    echo "----- end ${command_name} logs -----" >&2
+    rm -f "$log_file"
+    return 1
+}
+
 # Python used by the driver (runs locally on the master node)
 export PYSPARK_DRIVER_PYTHON=$(which python)
 # Python used by executors — points at the venv unpacked from the archive
 export PYSPARK_PYTHON=./.venv/bin/python
 
-spark-submit \
+echo ""
+echo "> Running search engine"
+
+run_quiet "Search Spark job" spark-submit \
     --master yarn \
     --deploy-mode client \
     --archives /app/.venv.tar.gz#.venv \

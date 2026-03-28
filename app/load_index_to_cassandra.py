@@ -1,9 +1,14 @@
+from __future__ import annotations
+
+import logging
 import subprocess
 import time
 from typing import Generator
-from cassandra.cluster import Cluster, PreparedStatement, Session
+from cassandra.cluster import Cluster, NoHostAvailable, PreparedStatement, Session
 from cassandra.concurrent import execute_concurrent_with_args
 from cassandra.policies import RetryPolicy
+
+logger = logging.getLogger(__name__)
 
 
 HDFS_BASE = "/indexer"
@@ -17,7 +22,6 @@ CREATE KEYSPACE IF NOT EXISTS {KEYSPACE}
 WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': 1}};
 """
 # Partition key = term so a query fetches all postings for a term in one read.
-# df is stored per posting to avoid a second round-trip to vocabulary.
 CREATE_INVERTED_INDEX = f"""
 CREATE TABLE IF NOT EXISTS {KEYSPACE}.inverted_index (
     term    text,
@@ -25,13 +29,6 @@ CREATE TABLE IF NOT EXISTS {KEYSPACE}.inverted_index (
     tf      int,
     df      int,
     PRIMARY KEY (term, doc_id)
-);
-"""
-# One row per unique term; used for vocabulary lookups.
-CREATE_VOCABULARY = f"""
-CREATE TABLE IF NOT EXISTS {KEYSPACE}.vocabulary (
-    term  text PRIMARY KEY,
-    df    int
 );
 """
 # Per-document token count and title - implements dl(d) in BM25.
@@ -50,7 +47,7 @@ CREATE TABLE IF NOT EXISTS {KEYSPACE}.corpus_stats (
     avg_doc_len double
 );
 """
-TABLES = ["inverted_index", "vocabulary", "doc_stats", "corpus_stats"]
+TABLES = ["inverted_index", "doc_stats", "corpus_stats"]
 
 
 def wait_for_cassandra(
@@ -73,7 +70,8 @@ def wait_for_cassandra(
             cluster.shutdown()
             print("Cassandra is ready.")
             return
-        except Exception:
+        except NoHostAvailable as exc:
+            logger.debug("Cassandra not yet reachable: %s", exc)
             time.sleep(interval)
     raise RuntimeError(f"Cassandra not available after {timeout}s")
 
@@ -102,7 +100,6 @@ def setup_schema(session: Session) -> None:
     for stmt in [
         CREATE_KEYSPACE,
         CREATE_INVERTED_INDEX,
-        CREATE_VOCABULARY,
         CREATE_DOC_STATS,
         CREATE_CORPUS_STATS,
     ]:
@@ -181,30 +178,6 @@ def load_inverted_index(session: Session, base_path: str) -> None:
     _flush(session, stmt, rows)
 
 
-def load_vocabulary(session: Session, base_path: str) -> None:
-    """Load the vocabulary into the Cassandra database.
-
-    Args:
-        session: The session to use to load the vocabulary.
-        base_path: The base path to the vocabulary.
-    """
-    print("Loading vocabulary")
-    stmt = session.prepare(
-        f"INSERT INTO {KEYSPACE}.vocabulary (term, df) VALUES (?, ?)"
-    )
-    rows: list[tuple[str, int]] = []
-    for line in hdfs_lines(f"{base_path}/vocabulary/part-*"):
-        parts = line.split("\t")
-        if len(parts) < 2:
-            continue
-        term, df = parts[0], int(parts[1])
-        rows.append((term, df))
-        if len(rows) >= BATCH:
-            _flush(session, stmt, rows)
-            rows = []
-    _flush(session, stmt, rows)
-
-
 def load_stats(session: Session, base_path: str) -> None:
     """Load doc_stats (one row per doc) and corpus_stats (__GLOBAL__ line).
 
@@ -247,7 +220,6 @@ def main():
         setup_schema(session)
         truncate_tables(session)
         load_inverted_index(session, HDFS_BASE)
-        load_vocabulary(session, HDFS_BASE)
         load_stats(session, HDFS_BASE)
     finally:
         cluster.shutdown()
