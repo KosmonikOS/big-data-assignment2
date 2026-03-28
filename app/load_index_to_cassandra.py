@@ -17,7 +17,7 @@ CREATE KEYSPACE IF NOT EXISTS {KEYSPACE}
 WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': 1}};
 """
 # Partition key = term so a query fetches all postings for a term in one read.
-# df is stored per posting to avoid a second round-trip to vocabulary at query time.
+# df is stored per posting to avoid a second round-trip to vocabulary.
 CREATE_INVERTED_INDEX = f"""
 CREATE TABLE IF NOT EXISTS {KEYSPACE}.inverted_index (
     term    text,
@@ -27,17 +27,18 @@ CREATE TABLE IF NOT EXISTS {KEYSPACE}.inverted_index (
     PRIMARY KEY (term, doc_id)
 );
 """
-# One row per unique term; used for vocabulary lookups and "term exists?" checks.
+# One row per unique term; used for vocabulary lookups.
 CREATE_VOCABULARY = f"""
 CREATE TABLE IF NOT EXISTS {KEYSPACE}.vocabulary (
     term  text PRIMARY KEY,
     df    int
 );
 """
-# Per-document token count — implements dl(d) in the BM25 formula.
+# Per-document token count and title - implements dl(d) in BM25.
 CREATE_DOC_STATS = f"""
 CREATE TABLE IF NOT EXISTS {KEYSPACE}.doc_stats (
     doc_id  text PRIMARY KEY,
+    title   text,
     length  int
 );
 """
@@ -115,7 +116,6 @@ def truncate_tables(session: Session) -> None:
     Args:
         session: The session to use to truncate the tables.
     """
-    """Clear all tables before loading so re-runs are idempotent."""
     for table in TABLES:
         session.execute(f"TRUNCATE {KEYSPACE}.{table}")
     print("Tables truncated.")
@@ -157,7 +157,7 @@ def _flush(session: Session, prepared: PreparedStatement, rows: list[tuple]) -> 
         execute_concurrent_with_args(session, prepared, rows, concurrency=50)
 
 
-def load_inverted_index(session: PreparedStatement, base_path: str) -> None:
+def load_inverted_index(session: Session, base_path: str) -> None:
     """Load the inverted index into the Cassandra database.
 
     Args:
@@ -169,7 +169,6 @@ def load_inverted_index(session: PreparedStatement, base_path: str) -> None:
         f"INSERT INTO {KEYSPACE}.inverted_index (term, doc_id, tf, df) VALUES (?, ?, ?, ?)"
     )
     rows: list[tuple[str, str, int, int]] = []
-    count = 0
     for line in hdfs_lines(f"{base_path}/index/part-*"):
         parts = line.split("\t")
         if len(parts) < 4:
@@ -178,10 +177,8 @@ def load_inverted_index(session: PreparedStatement, base_path: str) -> None:
         rows.append((term, doc_id, tf, df))
         if len(rows) >= BATCH:
             _flush(session, stmt, rows)
-            count += len(rows)
             rows = []
     _flush(session, stmt, rows)
-    count += len(rows)
 
 
 def load_vocabulary(session: Session, base_path: str) -> None:
@@ -196,7 +193,6 @@ def load_vocabulary(session: Session, base_path: str) -> None:
         f"INSERT INTO {KEYSPACE}.vocabulary (term, df) VALUES (?, ?)"
     )
     rows: list[tuple[str, int]] = []
-    count = 0
     for line in hdfs_lines(f"{base_path}/vocabulary/part-*"):
         parts = line.split("\t")
         if len(parts) < 2:
@@ -205,13 +201,11 @@ def load_vocabulary(session: Session, base_path: str) -> None:
         rows.append((term, df))
         if len(rows) >= BATCH:
             _flush(session, stmt, rows)
-            count += len(rows)
             rows = []
     _flush(session, stmt, rows)
-    count += len(rows)
 
 
-def load_stats(session: PreparedStatement, base_path: str) -> None:
+def load_stats(session: Session, base_path: str) -> None:
     """Load doc_stats (one row per doc) and corpus_stats (__GLOBAL__ line).
 
     Args:
@@ -220,13 +214,12 @@ def load_stats(session: PreparedStatement, base_path: str) -> None:
     """
     print("Loading doc_stats and corpus_stats")
     doc_stmt = session.prepare(
-        f"INSERT INTO {KEYSPACE}.doc_stats (doc_id, length) VALUES (?, ?)"
+        f"INSERT INTO {KEYSPACE}.doc_stats (doc_id, title, length) VALUES (?, ?, ?)"
     )
     corpus_stmt = session.prepare(
         f"INSERT INTO {KEYSPACE}.corpus_stats (id, num_docs, avg_doc_len) VALUES (?, ?, ?)"
     )
-    rows: list[tuple[str, int]] = []
-    doc_count = 0
+    rows: list[tuple[str, str, int]] = []
     for line in hdfs_lines(f"{base_path}/stats/part-*"):
         parts = line.split("\t")
         if parts[0] == "__GLOBAL__":
@@ -235,16 +228,15 @@ def load_stats(session: PreparedStatement, base_path: str) -> None:
             num_docs, avg_doc_len = int(parts[1]), float(parts[2])
             session.execute(corpus_stmt, ("global", num_docs, avg_doc_len))
         else:
-            if len(parts) < 2:
+            # Line is corrupted, skip it
+            if len(parts) < 3:
                 continue
-            doc_id, length = parts[0], int(parts[1])
-            rows.append((doc_id, length))
+            doc_id, title, length = parts[0], parts[1], int(parts[2])
+            rows.append((doc_id, title, length))
             if len(rows) >= BATCH:
                 _flush(session, doc_stmt, rows)
-                doc_count += len(rows)
                 rows = []
     _flush(session, doc_stmt, rows)
-    doc_count += len(rows)
 
 
 def main():

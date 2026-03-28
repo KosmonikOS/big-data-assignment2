@@ -9,6 +9,7 @@ for line in sys.stdin:
         continue
 
     parts = line.split("\t")
+    # Line is corrupted, skip it
     if len(parts) < 2:
         continue
 

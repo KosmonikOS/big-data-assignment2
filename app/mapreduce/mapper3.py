@@ -2,6 +2,18 @@ import sys
 import re
 
 
+def tokenize(text: str) -> list[str]:
+    """Lowercase and extract alphanumeric tokens
+
+    Args:
+        text: The text to tokenize.
+
+    Returns:
+        A list of alphanumeric tokens.
+    """
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -14,11 +26,10 @@ for line in sys.stdin:
 
     doc_id, title, text = parts[0], parts[1], parts[2]
 
-    # Extract only alphanumeric tokens
-    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    tokens = tokenize(text)
     length = len(tokens)
 
-    # Per-document length record
-    print(f"{doc_id}\t{length}")
+    # Per-document length record (title preserved for Cassandra storage)
+    print(f"{doc_id}\t{title}\t{length}")
     # For the global average calculation in the reducer
     print(f"__GLOBAL__\t{length}")

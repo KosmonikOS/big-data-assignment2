@@ -1,4 +1,6 @@
 import json
+import subprocess, os
+
 
 from pathvalidate import sanitize_filename
 from pyspark.sql import SparkSession
@@ -94,7 +96,16 @@ n = 1000
 total = df.count()
 fraction = min(1.0, (100 * n) / max(total, 1))
 df = df.sample(fraction=fraction, seed=0).limit(n)
+
+os.makedirs("data", exist_ok=True)
 df.foreach(create_doc)
+
+# Remove existing data from HDFS (to avoid errors on re-runs)
+subprocess.run(["hdfs", "dfs", "-rm", "-r", "-f", "/data"], check=False)
+subprocess.run(["hdfs", "dfs", "-rm", "-r", "-f", "/input/data"], check=False)
+
+# We need to move the data to HDFS before parsing it
+subprocess.run(["hdfs", "dfs", "-put", "data", "/"], check=True)
 
 rdd = spark.sparkContext.wholeTextFiles("/data")
 rdd.map(parse_doc).coalesce(1).saveAsTextFile("/input/data")

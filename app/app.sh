@@ -1,4 +1,6 @@
 #!/bin/bash
+set -e
+
 # Start ssh server
 service ssh restart 
 
