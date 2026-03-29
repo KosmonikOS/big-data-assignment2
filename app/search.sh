@@ -39,6 +39,7 @@ run_quiet "Search Spark job" spark-submit \
     --master yarn \
     --deploy-mode client \
     --archives /app/.venv.tar.gz#.venv \
+    --packages com.datastax.spark:spark-cassandra-connector_2.12:3.5.1 \
     --conf spark.yarn.appMasterEnv.PYSPARK_PYTHON=./.venv/bin/python \
     "$SCRIPT_DIR/query.py" \
     "$QUERY"

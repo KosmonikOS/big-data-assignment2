@@ -1,27 +1,24 @@
 from __future__ import annotations
 
 import logging
-import subprocess
 import time
-from typing import Generator
-from cassandra.cluster import Cluster, NoHostAvailable, PreparedStatement, Session
-from cassandra.concurrent import execute_concurrent_with_args
+
+from cassandra.cluster import Cluster, NoHostAvailable, Session
 from cassandra.policies import RetryPolicy
+from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.types import IntegerType, LongType, DoubleType, StringType, StructField, StructType
 
 logger = logging.getLogger(__name__)
 
-
-HDFS_BASE = "/indexer"
+HDFS_BASE = "hdfs://cluster-master:9000/indexer"
 CASSANDRA_HOST = "cassandra-server"
-BATCH = 500
 
-# DDL
 KEYSPACE = "search_engine"
 CREATE_KEYSPACE = f"""
 CREATE KEYSPACE IF NOT EXISTS {KEYSPACE}
 WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': 1}};
 """
-# Partition key = term so a query fetches all postings for a term in one read.
 CREATE_INVERTED_INDEX = f"""
 CREATE TABLE IF NOT EXISTS {KEYSPACE}.inverted_index (
     term    text,
@@ -31,7 +28,6 @@ CREATE TABLE IF NOT EXISTS {KEYSPACE}.inverted_index (
     PRIMARY KEY (term, doc_id)
 );
 """
-# Per-document token count and title - implements dl(d) in BM25.
 CREATE_DOC_STATS = f"""
 CREATE TABLE IF NOT EXISTS {KEYSPACE}.doc_stats (
     doc_id  text PRIMARY KEY,
@@ -39,7 +35,6 @@ CREATE TABLE IF NOT EXISTS {KEYSPACE}.doc_stats (
     length  int
 );
 """
-# Single-row table (id = 'global') for corpus-level BM25 constants N and dlavg.
 CREATE_CORPUS_STATS = f"""
 CREATE TABLE IF NOT EXISTS {KEYSPACE}.corpus_stats (
     id          text PRIMARY KEY,
@@ -48,6 +43,31 @@ CREATE TABLE IF NOT EXISTS {KEYSPACE}.corpus_stats (
 );
 """
 TABLES = ["inverted_index", "doc_stats", "corpus_stats"]
+
+_INVERTED_INDEX_SCHEMA = StructType([
+    StructField("term", StringType(), nullable=False),
+    StructField("doc_id", StringType(), nullable=False),
+    StructField("tf", IntegerType(), nullable=False),
+    StructField("df", IntegerType(), nullable=False),
+])
+
+_STATS_RAW_SCHEMA = StructType([
+    StructField("col0", StringType(), nullable=True),
+    StructField("col1", StringType(), nullable=True),
+    StructField("col2", StringType(), nullable=True),
+])
+
+_DOC_STATS_SCHEMA = StructType([
+    StructField("doc_id", StringType(), nullable=False),
+    StructField("title", StringType(), nullable=True),
+    StructField("length", IntegerType(), nullable=False),
+])
+
+_CORPUS_STATS_SCHEMA = StructType([
+    StructField("id", StringType(), nullable=False),
+    StructField("num_docs", LongType(), nullable=False),
+    StructField("avg_doc_len", DoubleType(), nullable=False),
+])
 
 
 def wait_for_cassandra(
@@ -59,8 +79,11 @@ def wait_for_cassandra(
         contact_points: A list of contact points to connect to Cassandra.
         timeout: The timeout in seconds.
         interval: The interval in seconds to check for Cassandra availability.
+
+    Raises:
+        RuntimeError: If Cassandra is not available after the timeout.
     """
-    print(f"Waiting for Cassandra at {contact_points}")
+    logger.info("Waiting for Cassandra at %s", contact_points)
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -68,7 +91,7 @@ def wait_for_cassandra(
             session = cluster.connect()
             session.execute("SELECT release_version FROM system.local")
             cluster.shutdown()
-            print("Cassandra is ready.")
+            logger.info("Cassandra is ready.")
             return
         except NoHostAvailable as exc:
             logger.debug("Cassandra not yet reachable: %s", exc)
@@ -76,14 +99,14 @@ def wait_for_cassandra(
     raise RuntimeError(f"Cassandra not available after {timeout}s")
 
 
-def connect(contact_points: list[str]) -> tuple[Cluster, Session]:
-    """Connect to Cassandra and return a cluster and session.
+def _cql_session(contact_points: list[str]) -> tuple[Cluster, Session]:
+    """Open a Cassandra cluster connection for DDL execution.
 
     Args:
         contact_points: A list of contact points to connect to Cassandra.
 
     Returns:
-        A tuple containing a cluster and session.
+        A tuple of (Cluster, Session) for the caller to close when done.
     """
     cluster = Cluster(contact_points, default_retry_policy=RetryPolicy())
     session = cluster.connect()
@@ -91,12 +114,11 @@ def connect(contact_points: list[str]) -> tuple[Cluster, Session]:
 
 
 def setup_schema(session: Session) -> None:
-    """Setup the schema for the Cassandra database.
+    """Create the keyspace and all three tables if they do not already exist.
 
     Args:
-        session: The session to use to setup the schema.
+        session: An open CQL session (no keyspace selected required).
     """
-    # Execute all DDL statements
     for stmt in [
         CREATE_KEYSPACE,
         CREATE_INVERTED_INDEX,
@@ -104,127 +126,137 @@ def setup_schema(session: Session) -> None:
         CREATE_CORPUS_STATS,
     ]:
         session.execute(stmt)
-    print("Schema created.")
+    logger.info("Schema created.")
 
 
 def truncate_tables(session: Session) -> None:
     """Clear all tables before loading so re-runs are idempotent.
 
     Args:
-        session: The session to use to truncate the tables.
+        session: An open CQL session (no keyspace selected required).
     """
     for table in TABLES:
         session.execute(f"TRUNCATE {KEYSPACE}.{table}")
-    print("Tables truncated.")
+    logger.info("Tables truncated.")
 
 
-def hdfs_lines(hdfs_glob: str) -> Generator[str, None, None]:
-    """Yield decoded lines from `hdfs dfs -cat <glob>`, skipping blank lines.
+def _cassandra_write(df: DataFrame, table: str) -> None:
+    """Write a DataFrame to a Cassandra table via the Spark-Cassandra Connector.
 
     Args:
-        hdfs_glob: The HDFS glob to read from.
+        df: The DataFrame to write. Column names must exactly match the target table.
+        table: The Cassandra table name within KEYSPACE.
+    """
+    df.write \
+        .format("org.apache.spark.sql.cassandra") \
+        .options(table=table, keyspace=KEYSPACE) \
+        .mode("append") \
+        .save()
+
+
+def load_inverted_index(spark: SparkSession, base_path: str) -> None:
+    """Read inverted index TSV files from HDFS and write to Cassandra.
+
+    Each line has the format: term\\tdoc_id\\ttf\\tdf
+
+    Args:
+        spark: Active SparkSession with Cassandra connector configured.
+        base_path: HDFS root path that contains the ``index/part-*`` files.
+    """
+    logger.info("Loading inverted_index from %s/index", base_path)
+    raw: DataFrame = (
+        spark.read
+        .option("sep", "\t")
+        .option("header", "false")
+        .schema(_INVERTED_INDEX_SCHEMA)
+        .csv(f"{base_path}/index/part-*")
+    )
+    df = raw.dropna(subset=["term", "doc_id"])
+    _cassandra_write(df, "inverted_index")
+    logger.info("inverted_index loaded.")
+
+
+def load_stats(spark: SparkSession, base_path: str) -> None:
+    """Read stats TSV files from HDFS and write to doc_stats and corpus_stats.
+
+    Two line formats are interleaved in the same part files:
+        - ``__GLOBAL__\\t<num_docs>\\t<avg_doc_len>`` — one corpus-level row
+        - ``<doc_id>\\t<title>\\t<length>``            — one row per document
+
+    Args:
+        spark: Active SparkSession with Cassandra connector configured.
+        base_path: HDFS root path that contains the ``stats/part-*`` files.
+    """
+    logger.info("Loading doc_stats and corpus_stats from %s/stats", base_path)
+    raw: DataFrame = (
+        spark.read
+        .option("sep", "\t")
+        .option("header", "false")
+        .schema(_STATS_RAW_SCHEMA)
+        .csv(f"{base_path}/stats/part-*")
+    )
+
+    doc_df: DataFrame = (
+        raw.filter(F.col("col0") != "__GLOBAL__")
+        .dropna(subset=["col0", "col2"])
+        .select(
+            F.col("col0").alias("doc_id"),
+            F.col("col1").alias("title"),
+            F.col("col2").cast(IntegerType()).alias("length"),
+        )
+    )
+    _cassandra_write(doc_df, "doc_stats")
+    logger.info("doc_stats loaded.")
+
+    corpus_df: DataFrame = (
+        raw.filter(F.col("col0") == "__GLOBAL__")
+        .dropna(subset=["col1", "col2"])
+        .select(
+            F.lit("global").alias("id"),
+            F.col("col1").cast(LongType()).alias("num_docs"),
+            F.col("col2").cast(DoubleType()).alias("avg_doc_len"),
+        )
+    )
+    _cassandra_write(corpus_df, "corpus_stats")
+    logger.info("corpus_stats loaded.")
+
+
+def build_spark_session() -> SparkSession:
+    """Create a SparkSession pre-configured for the Spark-Cassandra Connector.
 
     Returns:
-        A generator of decoded lines.
+        A configured SparkSession.
     """
-    proc = subprocess.Popen(
-        ["hdfs", "dfs", "-cat", hdfs_glob],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+    return (
+        SparkSession.builder
+        .appName("LoadIndexToCassandra")
+        .config("spark.cassandra.connection.host", CASSANDRA_HOST)
+        .getOrCreate()
     )
-    for raw in proc.stdout:
-        line = raw.decode("utf-8", errors="replace").rstrip("\n")
-        if line:
-            yield line
-    proc.wait()
-    if proc.returncode != 0:
-        err = proc.stderr.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"hdfs dfs -cat {hdfs_glob} failed:\n{err}")
 
 
-def _flush(session: Session, prepared: PreparedStatement, rows: list[tuple]) -> None:
-    """Flush rows to Cassandra.
+def main() -> None:
+    """Orchestrate schema setup and full data load from HDFS into Cassandra."""
+    logging.basicConfig(level=logging.INFO)
 
-    Args:
-        session: The session to use to flush the rows.
-        prepared: The prepared statement to use to flush the rows.
-        rows: The rows to flush.
-    """
-    if rows:
-        execute_concurrent_with_args(session, prepared, rows, concurrency=50)
-
-
-def load_inverted_index(session: Session, base_path: str) -> None:
-    """Load the inverted index into the Cassandra database.
-
-    Args:
-        session: The session to use to load the inverted index.
-        base_path: The base path to the inverted index.
-    """
-    print("Loading inverted_index")
-    stmt = session.prepare(
-        f"INSERT INTO {KEYSPACE}.inverted_index (term, doc_id, tf, df) VALUES (?, ?, ?, ?)"
-    )
-    rows: list[tuple[str, str, int, int]] = []
-    for line in hdfs_lines(f"{base_path}/index/part-*"):
-        parts = line.split("\t")
-        if len(parts) < 4:
-            continue
-        term, doc_id, tf, df = parts[0], parts[1], int(parts[2]), int(parts[3])
-        rows.append((term, doc_id, tf, df))
-        if len(rows) >= BATCH:
-            _flush(session, stmt, rows)
-            rows = []
-    _flush(session, stmt, rows)
-
-
-def load_stats(session: Session, base_path: str) -> None:
-    """Load doc_stats (one row per doc) and corpus_stats (__GLOBAL__ line).
-
-    Args:
-        session: The session to use to load the stats.
-        base_path: The base path to the stats.
-    """
-    print("Loading doc_stats and corpus_stats")
-    doc_stmt = session.prepare(
-        f"INSERT INTO {KEYSPACE}.doc_stats (doc_id, title, length) VALUES (?, ?, ?)"
-    )
-    corpus_stmt = session.prepare(
-        f"INSERT INTO {KEYSPACE}.corpus_stats (id, num_docs, avg_doc_len) VALUES (?, ?, ?)"
-    )
-    rows: list[tuple[str, str, int]] = []
-    for line in hdfs_lines(f"{base_path}/stats/part-*"):
-        parts = line.split("\t")
-        if parts[0] == "__GLOBAL__":
-            if len(parts) < 3:
-                continue
-            num_docs, avg_doc_len = int(parts[1]), float(parts[2])
-            session.execute(corpus_stmt, ("global", num_docs, avg_doc_len))
-        else:
-            # Line is corrupted, skip it
-            if len(parts) < 3:
-                continue
-            doc_id, title, length = parts[0], parts[1], int(parts[2])
-            rows.append((doc_id, title, length))
-            if len(rows) >= BATCH:
-                _flush(session, doc_stmt, rows)
-                rows = []
-    _flush(session, doc_stmt, rows)
-
-
-def main():
     wait_for_cassandra([CASSANDRA_HOST])
-    cluster, session = connect([CASSANDRA_HOST])
 
+    cluster, cql_session = _cql_session([CASSANDRA_HOST])
     try:
-        setup_schema(session)
-        truncate_tables(session)
-        load_inverted_index(session, HDFS_BASE)
-        load_stats(session, HDFS_BASE)
+        setup_schema(cql_session)
+        truncate_tables(cql_session)
     finally:
         cluster.shutdown()
 
-    print("All tables loaded successfully.")
+    spark = build_spark_session()
+    spark.sparkContext.setLogLevel("WARN")
+    try:
+        load_inverted_index(spark, HDFS_BASE)
+        load_stats(spark, HDFS_BASE)
+    finally:
+        spark.stop()
+
+    logger.info("All tables loaded successfully.")
 
 
 if __name__ == "__main__":

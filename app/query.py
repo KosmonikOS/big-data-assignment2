@@ -4,8 +4,9 @@ import math
 import re
 import sys
 
-from cassandra.cluster import Cluster
-from pyspark import SparkConf, SparkContext
+from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.types import ArrayType, StringType
 
 CASSANDRA_HOST = "cassandra-server"
 KEYSPACE = "search_engine"
@@ -15,124 +16,172 @@ TOP_N = 10
 
 
 def tokenize(text: str) -> list[str]:
-    """Lowercase and extract alphanumeric tokens
+    """Lowercase and extract alphanumeric tokens.
 
     Args:
         text: The text to tokenize.
 
     Returns:
-        A list of alphanumeric tokens.
+        A list of alphanumeric tokens in lowercase.
     """
-    return re.findall(r"[a-z0-9]+", text.lower())
+    return list(set(re.findall(r"[a-z0-9]+", text.lower())))
 
 
-def fetch_index_data(
-    query_terms: list[str],
-) -> tuple[int, float, list[tuple[str, str, int, int]], dict[str, int], dict[str, str]]:
-    """Fetch all data needed for BM25.
+def build_spark_session() -> SparkSession:
+    """Create a SparkSession pre-configured for the Spark-Cassandra Connector.
 
     Returns:
-        Tuple containing:
-        - total document count
-        - average document length in tokens
-        - list of (term, doc_id, tf, df) tuples for every query term
-        - {doc_id: token_count} for docs appearing in postings
-        - {doc_id: title} for docs appearing in postings
+        A configured SparkSession with BM25Search as the app name.
     """
-    cluster = Cluster([CASSANDRA_HOST])
-    session = cluster.connect(KEYSPACE)
-    try:
-        # 1. Corpus-level constants
-        row = session.execute(
-            "SELECT num_docs, avg_doc_len FROM corpus_stats WHERE id = 'global'"
-        ).one()
-        if row is None:
-            raise RuntimeError("corpus_stats table is empty — run index.sh first.")
-        num_docs = int(row.num_docs)
-        avg_doc_len = float(row.avg_doc_len)
+    return (
+        SparkSession.builder
+        .appName("BM25Search")
+        .config("spark.cassandra.connection.host", CASSANDRA_HOST)
+        .getOrCreate()
+    )
 
-        # 2. Postings for every query term from the inverted index
-        postings: list[tuple[str, str, int, int]] = []
-        for term in query_terms:
-            rows = session.execute(
-                "SELECT term, doc_id, tf, df FROM inverted_index WHERE term = %s",
-                [term],
-            )
-            for r in rows:
-                postings.append((r.term, r.doc_id, int(r.tf), int(r.df)))
 
-        # 3. Per-document lengths and titles for every doc that matched
-        matched_doc_ids = list({p[1] for p in postings})
-        doc_lengths: dict[str, int] = {}
-        doc_titles: dict[str, str] = {}
+def _cassandra_read(spark: SparkSession, table: str) -> DataFrame:
+    """Load an entire Cassandra table as a Spark DataFrame.
 
-        for doc_id in matched_doc_ids:
-            r = session.execute(
-                "SELECT length, title FROM doc_stats WHERE doc_id = %s", [doc_id]
-            ).one()
-            if r:
-                doc_lengths[doc_id] = int(r.length)
-                doc_titles[doc_id] = r.title or doc_id
+    Args:
+        spark: Active SparkSession with Cassandra connector configured.
+        table: The Cassandra table name within KEYSPACE.
 
-        return num_docs, avg_doc_len, postings, doc_lengths, doc_titles
-    finally:
-        cluster.shutdown()
+    Returns:
+        A DataFrame representing the full table contents.
+    """
+    return (
+        spark.read
+        .format("org.apache.spark.sql.cassandra")
+        .options(table=table, keyspace=KEYSPACE)
+        .load()
+    )
+
+
+def read_corpus_stats(spark: SparkSession) -> tuple[int, float]:
+    """Fetch corpus-level BM25 constants from Cassandra.
+
+    Args:
+        spark: Active SparkSession with Cassandra connector configured.
+
+    Returns:
+        A tuple of (num_docs, avg_doc_len).
+
+    Raises:
+        RuntimeError: If the corpus_stats table is empty.
+    """
+    rows = (
+        _cassandra_read(spark, "corpus_stats")
+        .filter(F.col("id") == "global")
+        .select("num_docs", "avg_doc_len")
+        .collect()
+    )
+    if not rows:
+        raise RuntimeError("corpus_stats table is empty — run index.sh first.")
+    return int(rows[0]["num_docs"]), float(rows[0]["avg_doc_len"])
+
+
+def read_postings(spark: SparkSession, query_terms: list[str]) -> DataFrame:
+    """Read inverted index rows matching any of the query terms.
+
+    The Spark-Cassandra Connector pushes the ``isin`` predicate down to
+    Cassandra so only matching partitions are scanned.
+
+    Args:
+        spark: Active SparkSession with Cassandra connector configured.
+        query_terms: Tokenised query terms to look up.
+
+    Returns:
+        A DataFrame with columns [term, doc_id, tf, df].
+    """
+    return (
+        _cassandra_read(spark, "inverted_index")
+        .filter(F.col("term").isin(query_terms))
+        .select("term", "doc_id", "tf", "df")
+    )
+
+
+def read_doc_stats(spark: SparkSession) -> DataFrame:
+    """Read per-document length and title from Cassandra.
+
+    Args:
+        spark: Active SparkSession with Cassandra connector configured.
+
+    Returns:
+        A DataFrame with columns [doc_id, length, title].
+    """
+    return (
+        _cassandra_read(spark, "doc_stats")
+        .select("doc_id", "length", "title")
+    )
 
 
 def compute_bm25(
-    sc: SparkContext,
-    postings: list[tuple[str, str, int, int]],
+    postings_df: DataFrame,
+    doc_stats_df: DataFrame,
     num_docs: int,
     avg_doc_len: float,
-    doc_lengths: dict[str, int],
     top_n: int = TOP_N,
-) -> list[tuple[str, float]]:
-    """Return top-10 (doc_id, bm25_score) pairs using PySpark RDD API.
+) -> DataFrame:
+    """Compute BM25 scores using the Spark DataFrame API.
+
+    BM25 score per (term, doc) pair:
+
+        idf   = log(N / df)
+        score = idf * (K1+1)*tf / (K1 * ((1-B) + B * dl/dlavg) + tf)
+
+    Scores are summed across all query terms per document, then the top-N
+    documents by total score are returned.
 
     Args:
-        sc: active SparkContext
-        postings: list of (term, doc_id, tf, df)
-        num_docs: N
-        avg_doc_len: dlavg
-        doc_lengths: {doc_id: length}
+        postings_df: DataFrame with columns [term, doc_id, tf, df].
+        doc_stats_df: DataFrame with columns [doc_id, length, title].
+        num_docs: Total number of documents in the corpus (N).
+        avg_doc_len: Average document length in tokens (dlavg).
+        top_n: Maximum number of top-scoring documents to return.
 
     Returns:
-        List of up to top_n (doc_id, score) tuples sorted descending by score.
+        A DataFrame with columns [doc_id, title, total_score] sorted
+        descending by total_score, limited to top_n rows.
     """
-    bc_N = sc.broadcast(num_docs)
-    bc_dlavg = sc.broadcast(avg_doc_len)
-    bc_dl = sc.broadcast(doc_lengths)
+    n_lit = F.lit(num_docs).cast("double")
+    dlavg_lit = F.lit(avg_doc_len)
+    k1_lit = F.lit(K1)
+    b_lit = F.lit(B)
 
-    postings_rdd = sc.parallelize(postings)
+    scored = (
+        postings_df
+        .join(doc_stats_df, on="doc_id", how="inner")
+        .withColumn(
+            "idf",
+            F.log(n_lit / F.col("df").cast("double")),
+        )
+        .withColumn(
+            "norm_tf",
+            (k1_lit + F.lit(1.0)) * F.col("tf").cast("double")
+            / (
+                k1_lit * (
+                    (F.lit(1.0) - b_lit)
+                    + b_lit * F.col("length").cast("double") / dlavg_lit
+                )
+                + F.col("tf").cast("double")
+            ),
+        )
+        .withColumn("score", F.col("idf") * F.col("norm_tf"))
+    )
 
-    def bm25_score(record: tuple[str, str, int, int]) -> tuple[str, float]:
-        """Calculate BM25 score for a document
-
-        Args:
-            record: tuple of (term, doc_id, tf, df)
-
-        Returns:
-            tuple of (doc_id, score)
-        """
-        _, doc_id, tf, df = record
-        N_val = bc_N.value
-        dlavg_val = bc_dlavg.value
-        dl = bc_dl.value.get(doc_id, dlavg_val)
-
-        idf = math.log(N_val / df) if df > 0 else 0.0
-        numerator = (K1 + 1) * tf
-        denominator = K1 * ((1 - B) + B * dl / dlavg_val) + tf
-        score = idf * numerator / denominator if denominator > 0 else 0.0
-        return (doc_id, score)
-
-    # Calculate BM25 score for each document and reduce by key to get the total score
-    scores_rdd = postings_rdd.map(bm25_score).reduceByKey(lambda a, b: a + b)
-
-    return scores_rdd.top(top_n, key=lambda x: x[1])
+    return (
+        scored
+        .groupBy("doc_id", "title")
+        .agg(F.sum("score").alias("total_score"))
+        .orderBy(F.desc("total_score"))
+        .limit(top_n)
+    )
 
 
 def main() -> None:
-    # Read query: prefer first CLI argument, fall back to stdin
+    """Parse the query, fetch index data, compute BM25, and print ranked results."""
     if len(sys.argv) > 1:
         query_text = " ".join(sys.argv[1:])
     else:
@@ -144,30 +193,33 @@ def main() -> None:
         print("No valid query terms found. Please enter query with at least one word.")
         sys.exit(0)
 
-    # Fetch index data from Cassandra
-    num_docs, avg_doc_len, postings, doc_lengths, doc_titles = fetch_index_data(
-        query_terms
-    )
+    spark = build_spark_session()
+    spark.sparkContext.setLogLevel("WARN")
 
-    if not postings:
+    try:
+        num_docs, avg_doc_len = read_corpus_stats(spark)
+        postings_df = read_postings(spark, query_terms)
+        if postings_df.rdd.isEmpty():
+            print("No matching documents found for the given query.")
+            sys.exit(0)
+
+        doc_stats_df = read_doc_stats(spark)
+        results_df = compute_bm25(
+            postings_df, doc_stats_df, num_docs, avg_doc_len, TOP_N
+        )
+
+        results = results_df.collect()
+    finally:
+        spark.stop()
+
+    if not results:
         print("No matching documents found for the given query.")
         sys.exit(0)
 
-    # Initialize Spark context
-    conf = SparkConf().setAppName("BM25Search")
-    sc = SparkContext(conf=conf)
-    sc.setLogLevel("WARN")
-
-    try:
-        # Compute BM25 scores
-        top_n = compute_bm25(sc, postings, num_docs, avg_doc_len, doc_lengths, TOP_N)
-    finally:
-        sc.stop()
-
-    print(f"\nTop {len(top_n)} relevant documents:")
-    for rank, (doc_id, score) in enumerate(top_n, 1):
-        title = doc_titles.get(doc_id, doc_id)
-        print(f"{rank:2}. [{doc_id}] {title}  (score={score:.4f})")
+    print(f"\nTop {len(results)} relevant documents:")
+    for rank, row in enumerate(results, 1):
+        title = row["title"] or row["doc_id"]
+        print(f"{rank:2}. [{row['doc_id']}] {title}  (score={row['total_score']:.4f})")
 
 
 if __name__ == "__main__":
